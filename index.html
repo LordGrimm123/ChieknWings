@@ -97,7 +97,8 @@
   <main class="wrap">
     <!-- LOGIN -->
     <section id="loginSection" class="panel login-shell">
-      <form id="loginForm" class="login-box card">
+      <!-- onsubmit="return false" prevents page reload even if JS fails before binding -->
+      <form id="loginForm" class="login-box card" onsubmit="return false">
         <h2 style="margin:0 0 14px 0">Sign in</h2>
         <div class="grid">
           <div>
@@ -109,7 +110,8 @@
             <input id="password" type="password" class="input" placeholder="••••••••" required />
           </div>
           <div class="row" style="margin-top:4px">
-            <button id="loginBtn" class="btn btn-primary" type="submit">Log in</button>
+            <!-- type="button" so clicking never submits the form -->
+            <button id="loginBtn" class="btn btn-primary" type="button">Log in</button>
             <span id="loginError" class="muted" style="margin-left:8px"></span>
           </div>
         </div>
@@ -291,12 +293,6 @@
       appId: "1:705608113463:web:eb70088734b33486c70eb2"
     };
     const APP_ID = "carpe_diem";
-    const app = initializeApp(FIREBASE_CONFIG);
-    const auth = getAuth(app);
-    const db = getFirestore(app);
-
-    /* Session-only persistence (no forced sign-out) */
-    await setPersistence(auth, browserSessionPersistence);
 
     /***** Elements *****/
     const $ = (id)=>document.getElementById(id);
@@ -304,16 +300,13 @@
     const loginForm    = $("loginForm");
     const loginBtn     = $("loginBtn");
     const loginError   = $("loginError");
-
     const dashboard    = $("dashboard");
     const roleHeader   = $("roleHeader");
     const logoutBtn    = $("logoutBtn");
-
     const traderMetrics = $("traderMetrics");
     const workingCapEl  = $("workingCap");
     const investedCapEl = $("investedCap");
     const profitLossEl  = $("profitLoss");
-
     const stockList = $("stockList");
     const detailName  = $("detailName");
     const detailPrice = $("detailPrice");
@@ -322,13 +315,11 @@
     const tradeMsg    = $("tradeMsg");
     const tradeBar    = $("tradeBar");
     const adminPortfolioView = $("adminPortfolioView");
-
     const autoPrice   = $("autoPrice");
     const autoQty     = $("autoQty");
     const setAutoBtn  = $("setAutoBtn");
     const clearAutoBtn= $("clearAutoBtn");
     const autoMsg     = $("autoMsg");
-
     const adminOnlyHint = $("adminOnlyHint");
     const adminControls = $("adminControls");
     const raiseBtn      = $("raiseBtn");
@@ -346,19 +337,17 @@
     const pfTable       = $("pfTable");
     const adminSelected = $("adminSelected");
     const adminSelectedPrice = $("adminSelectedPrice");
-
     const freezeBtn   = $("freezeBtn");
     const unfreezeBtn = $("unfreezeBtn");
     const freezeMsg   = $("freezeMsg");
-
     const traderSide      = $("traderSide");
     const traderPfSummary = $("traderPfSummary");
     const traderPfTable   = $("traderPfTable");
-
     const buyBtn  = $("buyBtn");
     const sellBtn = $("sellBtn");
 
     /***** State *****/
+    let app, auth, db;
     let me = null, myRole = null;
     let selectedId = null;
     let stocks = {}; // id -> { id, name, baseline, price, defaultBaseline, frozen }
@@ -366,14 +355,14 @@
 
     // Chart state
     let series = [];
-    const SAMPLE_MS = 120;      // ~8–9 fps
+    const SAMPLE_MS = 120;  // ~8–9 fps
     let lastSampleAt = 0;
     let chartCtx = $("chart").getContext("2d");
 
     // Ticking (app logic every 3s)
     const TICK_MS = 3000;
     let lastProcessedTick = -1;
-    let lastAutosTick = -1; // debounce auto-sell per tick
+    let lastAutosTick = -1;
     const tickPriceCache = {}; // { [stockId]: { tick, p0, p1, base } }
 
     const SEED_STOCKS = [
@@ -384,7 +373,33 @@
       "Power Grid","Adani Ports","Axis Bank","Maruti Suzuki","Grasim Industries"
     ];
 
-    /***** PRICING *****/
+    /************** LOGIN HANDLERS (attach first, never reload) **************/
+    loginForm.addEventListener("submit", (e)=> e.preventDefault()); // Enter key guard
+    // Disable until Firebase boot finishes (prevents clicks before auth is ready)
+    loginBtn.disabled = true;
+
+    loginBtn.addEventListener("click", async ()=>{
+      if (!auth) { loginError.textContent = "Initializing… please try again."; return; }
+      loginError.textContent = "";
+      loginBtn.disabled = true; loginBtn.textContent = "Logging in…";
+      try{
+        const email = $("email").value.trim();
+        const pass  = $("password").value.trim();
+        await signInWithEmailAndPassword(auth, email, pass);
+        // onAuthStateChanged will handle the rest
+      }catch(err){
+        loginError.textContent = err?.message || "Login failed.";
+      }finally{
+        loginBtn.disabled = false; loginBtn.textContent = "Log in";
+      }
+    });
+
+    logoutBtn.addEventListener("click", async ()=>{
+      try { await signOut(auth); } catch(e){}
+      location.reload();
+    });
+
+    /***** Pricing *****/
     function clamp(n){ return Math.max(1, Number.isFinite(n)? n : 0); }
     function currentPriceFor(stock){
       if (!stock) return 0;
@@ -402,7 +417,6 @@
       return +(300 + ((h % 90000) / 100)).toFixed(2); // 300.00 – 1200.00
     }
     function currentTick(){ return Math.floor(Date.now() / TICK_MS); }
-
     function priceAt(stock, nowMs){
       if (!stock) return 0;
       const base = Number.isFinite(stock.baseline) ? stock.baseline : (stock.defaultBaseline||500);
@@ -436,7 +450,6 @@
 
     /***** Role auto-provision *****/
     async function ensureRole(user){
-      // 1) Check doc by UID
       const roleDocRef = doc(db, "artifacts", APP_ID, "public", "data", "roles", user.uid);
       try{
         const roleDoc = await getDoc(roleDocRef);
@@ -444,9 +457,7 @@
           const role = roleDoc.data()?.role || null;
           if (role) return role;
         }
-      }catch(e){ /* continue to fallback */ }
-
-      // 2) Fallback by email match (any doc in roles with email == user.email)
+      }catch(_) {}
       try{
         if (user.email){
           const rolesCol = collection(db, "artifacts", APP_ID, "public", "data", "roles");
@@ -454,84 +465,69 @@
           const snap = await getDocs(qEmail);
           if (!snap.empty){
             const role = snap.docs[0].data()?.role || "trader";
-            // also backfill UID doc for faster next logins
-            try{ await setDoc(roleDocRef, { email: user.email, role }, { merge: true }); }catch(_){}
+            try{ await setDoc(roleDocRef, { email:user.email, role }, { merge:true }); }catch(_){}
             return role;
           }
         }
-      }catch(e){ /* ignore and auto-provision */ }
-
-      // 3) Auto-provision default role: trader
+      }catch(_) {}
       try{
-        await setDoc(roleDocRef, { email: user.email || "", role: "trader" }, { merge: true });
+        await setDoc(roleDocRef, { email: user.email || "", role: "trader" }, { merge:true });
         return "trader";
-      }catch(e){
-        return null; // last resort -> caller will showLogin with message
+      }catch(_){
+        return null;
       }
     }
 
-    /***** Auth & Roles *****/
-    onAuthStateChanged(auth, async (user)=>{
-      if(!user){ showLogin(); return; }
-      me = user;
+    /***** Auth & app boot (no top-level await blockers) *****/
+    async function boot(){
+      app = initializeApp(FIREBASE_CONFIG);
+      auth = getAuth(app);
+      db   = getFirestore(app);
 
-      // Auto-provision & resolve role
-      myRole = await ensureRole(user);
-      if(!myRole){
-        showLogin("Could not load or create your role. Please retry.");
-        return;
-      }
+      try { await setPersistence(auth, browserSessionPersistence); }
+      catch(e){ console.warn("setPersistence failed:", e); }
 
-      roleHeader.textContent = `Welcome, ${myRole}`;
+      onAuthStateChanged(auth, async (user)=>{
+        if(!user){ showLogin(); return; }
+        me = user;
 
-      // Trader metrics visibility
-      traderMetrics.classList.toggle("hidden", myRole === "admin");
+        myRole = await ensureRole(user);
+        if(!myRole){ showLogin("Could not load or create your role. Please retry."); return; }
 
-      const isAdmin = myRole === "admin";
-      chartEl.classList.toggle("hidden", isAdmin);
-      tradeBar.classList.toggle("hidden", isAdmin);
-      $("autoRow").classList.toggle("hidden", isAdmin);
-      adminPortfolioView.classList.toggle("hidden", !isAdmin);
-      adminControls.classList.toggle("hidden", !isAdmin ? true : false);
-      $("adminOnlyHint").classList.add("hidden");
-      traderSide.classList.toggle("hidden", !isAdmin ? false : true);
+        roleHeader.textContent = `Welcome, ${myRole}`;
 
-      loginSection.classList.add("hidden");
-      dashboard.classList.remove("hidden");
+        const isAdmin = (myRole === "admin");
+        traderMetrics.classList.toggle("hidden", isAdmin);
+        chartEl.classList.toggle("hidden", isAdmin);
+        tradeBar.classList.toggle("hidden", isAdmin);
+        $("autoRow").classList.toggle("hidden", isAdmin);
+        adminPortfolioView.classList.toggle("hidden", !isAdmin);
+        adminControls.classList.toggle("hidden", !isAdmin ? true : false);
+        adminOnlyHint.classList.add("hidden");
+        traderSide.classList.toggle("hidden", !isAdmin ? false : true);
 
-      await bootstrapStocks();
-      attachRealtime();
-      attachTraderDoc();
-      if (isAdmin) { loadRankingsLoop(); fillTraderDropdown(); }
+        loginSection.classList.add("hidden");
+        dashboard.classList.remove("hidden");
 
-      initCanvasHiDPI();
-      startTickLoop();   // 3s logic
-      startChartLoop();  // smooth chart
-    });
+        await bootstrapStocks();
+        attachRealtime();
+        attachTraderDoc();
+        if (isAdmin) { loadRankingsLoop(); fillTraderDropdown(); }
+
+        initCanvasHiDPI();
+        startTickLoop();
+        startChartLoop();
+      });
+
+      // Now users can click the button
+      loginBtn.disabled = false;
+    }
 
     function showLogin(msg){
       dashboard.classList.add("hidden");
       loginSection.classList.remove("hidden");
       if (msg) loginError.textContent = msg;
     }
-
-    loginForm.addEventListener("submit", async (e)=>{
-      e.preventDefault();
-      loginError.textContent = ""; loginBtn.disabled = true; loginBtn.textContent = "Logging in…";
-      try{
-        await signInWithEmailAndPassword(auth, $("email").value.trim(), $("password").value.trim());
-      }catch(err){
-        // functionally safe & simple
-        loginError.textContent = err?.message || "Login failed.";
-      }finally{
-        loginBtn.disabled = false; loginBtn.textContent = "Log in";
-      }
-    });
-
-    logoutBtn.addEventListener("click", async ()=>{
-      await signOut(auth);
-      location.reload();
-    });
 
     /***** Stocks *****/
     function slug(s){ return s.toLowerCase().replace(/[^a-z0-9]+/g,"_"); }
@@ -544,10 +540,11 @@
       const col = collection(db,"artifacts",APP_ID,"public","data","stocks");
       const snap = await getDocs(col);
       if (snap.empty){
+        // Create seed docs (best-effort)
         for(const name of SEED_STOCKS){
           const id = slug(name);
           const base = detBase(name);
-          try{ await setDoc(doc(col,id), { name, baseline: base, frozen:false }, { merge:true }); }catch(e){}
+          try{ await setDoc(doc(col,id), { name, baseline: base, frozen:false }, { merge:true }); }catch(_){}
         }
       }
     }
@@ -573,7 +570,6 @@
             defaultBaseline: prev.defaultBaseline || detBase(data.name||id),
             frozen: !!data.frozen
           };
-
           if (baselineChanged) tickPriceCache[id] = null;
         });
         renderStockTiles();
@@ -639,7 +635,7 @@
       detailPrice.textContent = `₹ ${fmt(newBase)}${s.frozen?' • FROZEN':''}`;
 
       try{ await updateDoc(ref, { baseline:newBase }); }
-      catch(err){ try{ await setDoc(ref, { name: s.name || selectedId, baseline: newBase }, { merge: true }); }catch(e){} }
+      catch(err){ try{ await setDoc(ref, { name: s.name || selectedId, baseline: newBase }, { merge: true }); }catch(_ ){} }
     }
 
     /***** Freeze / Unfreeze *****/
@@ -653,7 +649,7 @@
         s.frozen = true; stocks[selectedId] = s; tickPriceCache[selectedId] = null;
         freezeMsg.textContent = "Selected stock frozen.";
         updateTradeControls();
-      }catch(e){ freezeMsg.textContent = "Could not freeze stock."; }
+      }catch(_){ freezeMsg.textContent = "Could not freeze stock."; }
     });
 
     unfreezeBtn?.addEventListener("click", async ()=>{
@@ -666,10 +662,10 @@
         s.frozen = false; stocks[selectedId] = s; tickPriceCache[selectedId] = null;
         freezeMsg.textContent = "Selected stock unfrozen.";
         updateTradeControls();
-      }catch(e){ freezeMsg.textContent = "Could not unfreeze stock."; }
+      }catch(_){ freezeMsg.textContent = "Could not unfreeze stock."; }
     });
 
-    /***** Trader doc + Auto-sell *****/
+    /***** Trader doc + Auto-sell (stop-loss: sell when price <= target) *****/
     function traderRef(uid){ return doc(db,"artifacts",APP_ID,"public","data","traders", uid); }
 
     function updateTraderMetrics(){
@@ -733,7 +729,6 @@
       autoMsg.textContent = "Cleared.";
     });
 
-    // AUTO-SELL: stop-loss (fires when tick price <= target)
     async function checkAutoSells(tick){
       if (!me || myRole!=="trader" || !myTrader) return;
       if (tick === lastAutosTick) return; // once per tick
@@ -765,7 +760,7 @@
               autoMsg.textContent = `Auto-sold at ₹${fmt(price)} (rule cleared)`;
               autoPrice.value = ""; autoQty.value = "";
             }
-          }catch(e){ /* ignore transient */ }
+          }catch(_) { /* ignore transient */ }
         }
       }
     }
@@ -1004,6 +999,9 @@
 
     /***** Rankings timers *****/
     function loadRankingsLoop(){ loadRankings(); setInterval(loadRankings, 6000); }
+
+    // Kick off app
+    boot();
   </script>
 </body>
 </html>
