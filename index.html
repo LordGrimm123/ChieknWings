@@ -192,6 +192,17 @@
                 <thead><tr><th>Stock</th><th>Qty</th><th>Price</th><th>Value</th></tr></thead>
                 <tbody id="pfTable"></tbody>
               </table>
+
+              <!-- NEW: trade history for selected trader -->
+              <h4 style="margin:12px 0 6px 0">Trade History</h4>
+              <div id="historyWrap" class="card" style="padding:8px; max-height:240px; overflow:auto">
+                <table style="width:100%">
+                  <thead>
+                    <tr><th>Time</th><th>Action</th><th>Stock</th><th>Qty</th><th>Price</th><th>Value</th></tr>
+                  </thead>
+                  <tbody id="historyTable"></tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
@@ -295,13 +306,10 @@
     const auth = getAuth(app);
     const db = getFirestore(app);
 
-    /* Session persistence (wrapped to avoid blocking the module on errors) */
+    /* Session persistence (non-blocking) */
     (async () => {
-      try {
-        await setPersistence(auth, browserSessionPersistence);
-      } catch (e) {
-        console.warn("Auth persistence not set:", e?.message || e);
-      }
+      try { await setPersistence(auth, browserSessionPersistence); }
+      catch(e){ console.warn("Auth persistence not set:", e?.message||e); }
     })();
 
     /***** Elements *****/
@@ -364,6 +372,9 @@
     const buyBtn  = $("buyBtn");
     const sellBtn = $("sellBtn");
 
+    // NEW: history table elements (admin view)
+    const historyTable = $("historyTable");
+
     /***** State *****/
     let me = null, myRole = null;
     let selectedId = null;
@@ -377,7 +388,8 @@
 
     // price step timer
     const TICK_MS = 3000;
-    let lastProcessedTick = -1; // also used to throttle autos
+    let lastProcessedTick = -1;  // price tick
+    let lastAutosTick = -1;      // <-- separate gate for auto-sells (FIX)
 
     const SEED_STOCKS = [
       "Reliance Industries","TCS","Infosys","HDFC Bank","ICICI Bank",
@@ -432,7 +444,7 @@
       adminPortfolioView.classList.toggle("hidden", !isAdmin);
       adminControls.classList.toggle("hidden", !isAdmin);
       adminOnlyHint.classList.toggle("hidden", isAdmin);
-      traderSide.classList.toggle("hidden", isAdmin); // show trader portfolio only for traders
+      traderSide.classList.toggle("hidden", isAdmin);
 
       loginSection.classList.add("hidden");
       dashboard.classList.remove("hidden");
@@ -454,7 +466,7 @@
       if (msg) loginError.textContent = msg;
     }
 
-    // Stable login (prevents form refresh loop even if handlers aren't ready)
+    // Stable login
     loginForm.addEventListener("submit", async (e)=>{
       e.preventDefault();
       loginError.textContent = ""; loginBtn.disabled = true; loginBtn.textContent = "Logging in…";
@@ -462,7 +474,6 @@
       const pass  = $("password").value.trim();
       try{
         await signInWithEmailAndPassword(auth, email, pass);
-        // onAuthStateChanged will run next
       }catch(err){
         loginError.innerHTML = `<small class="err">${err.message}</small>`;
       }finally{
@@ -485,7 +496,6 @@
       });
       const col = collection(db,"artifacts",APP_ID,"public","data","stocks");
       const snap = await getDocs(col);
-      // Seed the collection if empty (admin or anyone — harmless with merge)
       if (snap.empty){
         for(const name of SEED_STOCKS){
           const id = slug(name);
@@ -638,10 +648,10 @@
       const ref = traderRef(me.uid);
       const s = await getDoc(ref);
       if(!s.exists()){
-        await setDoc(ref, { cash: 100000, initialCash: 100000, portfolio:{}, autos:{} }, { merge:true });
+        await setDoc(ref, { cash: 100000, initialCash: 100000, portfolio:{}, autos:{}, history:[] }, { merge:true });
       }
       onSnapshot(ref, snap=>{
-        myTrader = snap.exists()? snap.data() : { cash:0, initialCash:0, portfolio:{}, autos:{} };
+        myTrader = snap.exists()? snap.data() : { cash:0, initialCash:0, portfolio:{}, autos:{}, history:[] };
         if (myRole === "trader") {
           traderMetrics.classList.remove("hidden");
           traderSide.classList.remove("hidden");
@@ -678,10 +688,12 @@
       autoMsg.textContent = "Cleared.";
     });
 
-    // Run once per price tick
+    // Once per tick (FIXED: uses its own lastAutosTick)
     async function checkAutoSells(tick){
       if (!me || myRole!=="trader" || !myTrader) return;
-      if (tick === lastProcessedTick) return; // already processed in this tick
+      if (tick === lastAutosTick) return;      // already processed this tick
+      lastAutosTick = tick;
+
       const autos = myTrader.autos || {};
       for (const [sid, rule] of Object.entries(autos)){
         const st = stocks[sid]; if (!st || st.frozen) continue;
@@ -691,18 +703,27 @@
           try{
             await runTransaction(db, async (tx)=>{
               const snap = await tx.get(ref);
-              const t = snap.exists()? snap.data(): { cash:0, initialCash:0, portfolio:{}, autos:{} };
+              const t = snap.exists()? snap.data(): { cash:0, initialCash:0, portfolio:{}, autos:{}, history:[] };
               const pos = t.portfolio?.[sid] || { quantity:0 };
               const sellQty = Math.min(rule.qty||0, pos.quantity||0);
               const newAutos = { ...(t.autos||{}) }; delete newAutos[sid];
+
+              const history = Array.isArray(t.history) ? [...t.history] : [];
               if (sellQty > 0){
                 const newCash = (+t.cash||0) + sellQty*price;
                 const newQty = (pos.quantity||0) - sellQty;
                 const newPortfolio = { ...(t.portfolio||{}) };
                 if (newQty>0) newPortfolio[sid] = { quantity:newQty }; else delete newPortfolio[sid];
-                tx.set(ref, { cash:+newCash.toFixed(2), portfolio:newPortfolio, autos:newAutos }, { merge:true });
+
+                history.push({
+                  ts: Date.now(), kind: "auto-sell", stockId: sid, stockName: stocks[sid]?.name||sid,
+                  qty: sellQty, price: +price, value: +(sellQty*price).toFixed(2)
+                });
+                if (history.length > 500) history.splice(0, history.length-500);
+
+                tx.set(ref, { cash:+newCash.toFixed(2), portfolio:newPortfolio, autos:newAutos, history }, { merge:true });
               } else {
-                tx.set(ref, { autos:newAutos }, { merge:true });
+                tx.set(ref, { autos:newAutos, history }, { merge:true });
               }
             });
             if (sid===selectedId){
@@ -738,7 +759,7 @@
       const rSnap=await getDocs(rolesCol);
       for(const d of rSnap.docs){
         if(d.data().role==="trader"){
-          await setDoc(traderRef(d.id),{cash:amt,initialCash:amt,portfolio:{},autos:{}},{merge:true});
+          await setDoc(traderRef(d.id),{cash:amt,initialCash:amt,portfolio:{},autos:{},history:[]},{merge:true});
         }
       }
       fundsMsg.textContent="Updated for all traders.";
@@ -753,7 +774,7 @@
       const rSnap=await getDocs(rolesCol);
       for(const d of rSnap.docs){
         if(d.data().role==="trader"){
-          await setDoc(traderRef(d.id),{cash:100000,initialCash:100000,portfolio:{},autos:{}},{merge:true});
+          await setDoc(traderRef(d.id),{cash:100000,initialCash:100000,portfolio:{},autos:{},history:[]},{merge:true});
         }
       }
 
@@ -791,6 +812,10 @@
     }
     function loadRankingsLoop(){ loadRankings(); setInterval(loadRankings, 6000); }
 
+    function formatTime(ts){
+      try{ return new Date(ts).toLocaleString('en-IN'); }catch(_){ return String(ts); }
+    }
+
     async function fillTraderDropdown(){
       const rolesCol = collection(db,"artifacts",APP_ID,"public","data","roles");
       const rSnap = await getDocs(rolesCol);
@@ -820,6 +845,8 @@
         if (!snap.exists()){ portfolioWrap.style.display="none"; return; }
         const data = snap.data();
         pfTitle.textContent = `Portfolio – ${traderSelect.selectedOptions[0].textContent}`;
+
+        // Portfolio table
         pfTable.innerHTML = "";
         Object.entries(data.portfolio||{}).forEach(([sid,pos])=>{
           const p = currentPriceFor(stocks[sid]);
@@ -830,6 +857,17 @@
         });
         portfolioWrap.style.display = "block";
         refreshAdminPortfolioSummary(uid, data);
+
+        // Trade history table (latest first)
+        const hist = Array.isArray(data.history) ? [...data.history] : [];
+        hist.sort((a,b)=> b.ts - a.ts);
+        historyTable.innerHTML = "";
+        hist.slice(0,200).forEach(h=>{
+          const tr = document.createElement("tr"); tr.className="data";
+          const act = (h.kind||'').toUpperCase();
+          tr.innerHTML = `<td>${formatTime(h.ts)}</td><td>${act}</td><td>${h.stockName||h.stockId||''}</td><td>${h.qty||0}</td><td>₹ ${fmt(h.price||0)}</td><td>₹ ${fmt(h.value||0)}</td>`;
+          historyTable.appendChild(tr);
+        });
       });
     }
 
@@ -873,14 +911,13 @@
       const tickLoop = ()=>{
         const tick = Math.floor(Date.now()/TICK_MS);
         if (tick !== lastProcessedTick){
-          lastProcessedTick = tick;
           // step changes (every 3s)
           Object.values(stocks).forEach(s => jumpOnce(s));
-          // process autos once per tick
+          // process autos once per tick (FIXED)
           checkAutoSells(tick);
+          lastProcessedTick = tick;
         }
       };
-      // run often, but only acts once per 3s tick
       setInterval(tickLoop, 200);
       tickLoop();
     }
@@ -948,7 +985,7 @@
       traderPfSummary.textContent = `Working: ₹${fmt(cash)}  •  Invested: ₹${fmt(invested)}  •  P/L: ${pl>=0?'+':''}${fmt(pl)} (${fmt(plPct)}%)`;
     }
 
-    /***** Trading (transactional) *****/
+    /***** Trading (transactional + history) *****/
     buyBtn.addEventListener("click", ()=> trade("buy"));
     sellBtn.addEventListener("click",()=> trade("sell"));
 
@@ -966,10 +1003,12 @@
       try{
         await runTransaction(db, async (tx)=>{
           const snap = await tx.get(ref);
-          const t = snap.exists()? snap.data(): { cash:100000, initialCash:100000, portfolio:{} };
+          const t = snap.exists()? snap.data(): { cash:100000, initialCash:100000, portfolio:{}, autos:{}, history:[] };
           const portfolio = t.portfolio || {};
           const pos = portfolio[selectedId] || { quantity:0 };
           const cash = +t.cash || 0;
+
+          const history = Array.isArray(t.history) ? [...t.history] : [];
 
           if (kind === "buy"){
             const cost = q * price;
@@ -977,7 +1016,11 @@
             const newCash = +(cash - cost).toFixed(2);
             const newQty = (pos.quantity||0) + q;
             const newPortfolio = { ...portfolio, [selectedId]: { quantity:newQty } };
-            tx.set(ref, { cash:newCash, portfolio:newPortfolio }, { merge:true });
+
+            history.push({ ts: Date.now(), kind:"buy", stockId:selectedId, stockName: st?.name||selectedId, qty:q, price:+price, value:+(q*price).toFixed(2) });
+            if (history.length > 500) history.splice(0, history.length-500);
+
+            tx.set(ref, { cash:newCash, portfolio:newPortfolio, history }, { merge:true });
           } else {
             const have = pos.quantity||0;
             if (have < q) throw new Error("Not enough shares.");
@@ -986,7 +1029,11 @@
             const newPortfolio = { ...portfolio };
             if (newQty > 0) newPortfolio[selectedId] = { quantity:newQty };
             else delete newPortfolio[selectedId];
-            tx.set(ref, { cash:newCash, portfolio:newPortfolio }, { merge:true });
+
+            history.push({ ts: Date.now(), kind:"sell", stockId:selectedId, stockName: st?.name||selectedId, qty:q, price:+price, value:+(q*price).toFixed(2) });
+            if (history.length > 500) history.splice(0, history.length-500);
+
+            tx.set(ref, { cash:newCash, portfolio:newPortfolio, history }, { merge:true });
           }
         });
 
