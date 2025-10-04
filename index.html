@@ -97,7 +97,6 @@
   <main class="wrap">
     <!-- LOGIN -->
     <section id="loginSection" class="panel login-shell">
-      <!-- onsubmit="return false" prevents page reload even if JS fails before binding -->
       <form id="loginForm" class="login-box card" onsubmit="return false">
         <h2 style="margin:0 0 14px 0">Sign in</h2>
         <div class="grid">
@@ -110,7 +109,7 @@
             <input id="password" type="password" class="input" placeholder="••••••••" required />
           </div>
           <div class="row" style="margin-top:4px">
-            <!-- type="button" so clicking never submits the form -->
+            <!-- IMPORTANT: button is not a submit -->
             <button id="loginBtn" class="btn btn-primary" type="button">Log in</button>
             <span id="loginError" class="muted" style="margin-left:8px"></span>
           </div>
@@ -277,7 +276,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/12.3.0/firebase-app.js";
     import {
       getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
-      setPersistence, browserSessionPersistence
+      setPersistence, browserSessionPersistence, inMemoryPersistence
     } from "https://www.gstatic.com/firebasejs/12.3.0/firebase-auth.js";
     import {
       getFirestore, doc, getDoc, setDoc, updateDoc, collection, getDocs,
@@ -293,6 +292,9 @@
       appId: "1:705608113463:web:eb70088734b33486c70eb2"
     };
     const APP_ID = "carpe_diem";
+    const app = initializeApp(FIREBASE_CONFIG);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
 
     /***** Elements *****/
     const $ = (id)=>document.getElementById(id);
@@ -300,13 +302,16 @@
     const loginForm    = $("loginForm");
     const loginBtn     = $("loginBtn");
     const loginError   = $("loginError");
+
     const dashboard    = $("dashboard");
     const roleHeader   = $("roleHeader");
     const logoutBtn    = $("logoutBtn");
+
     const traderMetrics = $("traderMetrics");
     const workingCapEl  = $("workingCap");
     const investedCapEl = $("investedCap");
     const profitLossEl  = $("profitLoss");
+
     const stockList = $("stockList");
     const detailName  = $("detailName");
     const detailPrice = $("detailPrice");
@@ -315,11 +320,13 @@
     const tradeMsg    = $("tradeMsg");
     const tradeBar    = $("tradeBar");
     const adminPortfolioView = $("adminPortfolioView");
+
     const autoPrice   = $("autoPrice");
     const autoQty     = $("autoQty");
     const setAutoBtn  = $("setAutoBtn");
     const clearAutoBtn= $("clearAutoBtn");
     const autoMsg     = $("autoMsg");
+
     const adminOnlyHint = $("adminOnlyHint");
     const adminControls = $("adminControls");
     const raiseBtn      = $("raiseBtn");
@@ -337,33 +344,36 @@
     const pfTable       = $("pfTable");
     const adminSelected = $("adminSelected");
     const adminSelectedPrice = $("adminSelectedPrice");
+
     const freezeBtn   = $("freezeBtn");
     const unfreezeBtn = $("unfreezeBtn");
     const freezeMsg   = $("freezeMsg");
+
     const traderSide      = $("traderSide");
     const traderPfSummary = $("traderPfSummary");
     const traderPfTable   = $("traderPfTable");
+
     const buyBtn  = $("buyBtn");
     const sellBtn = $("sellBtn");
 
     /***** State *****/
-    let app, auth, db;
     let me = null, myRole = null;
     let selectedId = null;
-    let stocks = {}; // id -> { id, name, baseline, price, defaultBaseline, frozen }
+    let stocks = {};
     let myTrader = null;
 
     // Chart state
     let series = [];
-    const SAMPLE_MS = 120;  // ~8–9 fps
+    const SAMPLE_MS = 120;
     let lastSampleAt = 0;
     let chartCtx = $("chart").getContext("2d");
 
-    // Ticking (app logic every 3s)
+    // Ticking
     const TICK_MS = 3000;
     let lastProcessedTick = -1;
     let lastAutosTick = -1;
-    const tickPriceCache = {}; // { [stockId]: { tick, p0, p1, base } }
+
+    const tickPriceCache = {}; // { [stockId]: {tick,p0,p1,base} }
 
     const SEED_STOCKS = [
       "Reliance Industries","TCS","Infosys","HDFC Bank","ICICI Bank",
@@ -373,33 +383,110 @@
       "Power Grid","Adani Ports","Axis Bank","Maruti Suzuki","Grasim Industries"
     ];
 
-    /************** LOGIN HANDLERS (attach first, never reload) **************/
-    loginForm.addEventListener("submit", (e)=> e.preventDefault()); // Enter key guard
-    // Disable until Firebase boot finishes (prevents clicks before auth is ready)
-    loginBtn.disabled = true;
+    /***** Prevent default form submit early (no reload) *****/
+    loginForm.addEventListener("submit", (e)=> e.preventDefault());
 
+    /***** Login button -> Firebase sign-in (no reload) *****/
     loginBtn.addEventListener("click", async ()=>{
-      if (!auth) { loginError.textContent = "Initializing… please try again."; return; }
       loginError.textContent = "";
+      const email = document.getElementById("email").value.trim();
+      const pass  = document.getElementById("password").value.trim();
+      if (!email || !pass){
+        loginError.innerHTML = `<small class="err">Enter email and password.</small>`;
+        return;
+      }
       loginBtn.disabled = true; loginBtn.textContent = "Logging in…";
       try{
-        const email = $("email").value.trim();
-        const pass  = $("password").value.trim();
         await signInWithEmailAndPassword(auth, email, pass);
-        // onAuthStateChanged will handle the rest
+        // onAuthStateChanged will continue the flow
       }catch(err){
-        loginError.textContent = err?.message || "Login failed.";
+        const msg = mapAuthError(err);
+        loginError.innerHTML = `<small class="err">${msg}</small>`;
       }finally{
         loginBtn.disabled = false; loginBtn.textContent = "Log in";
       }
     });
 
+    /***** Persistence set-up (never block module; never crash) *****/
+    (async ()=>{
+      try{
+        await setPersistence(auth, browserSessionPersistence);
+      }catch(e){
+        try{
+          await setPersistence(auth, inMemoryPersistence);
+        }catch(_){}
+      }
+      // Optional: clear any previous session to always require fresh login per tab
+      try{ await signOut(auth); }catch(_){}
+    })();
+
+    /***** Auth & Roles *****/
+    onAuthStateChanged(auth, async (user)=>{
+      if(!user){ showLogin(); return; }
+      me = user;
+
+      // role by UID first; fallback by email
+      let myRoleDoc = await getDoc(doc(db,"artifacts",APP_ID,"public","data","roles", user.uid));
+      if (myRoleDoc.exists()){
+        myRole = myRoleDoc.data().role;
+      } else {
+        const rolesCol = collection(db,"artifacts",APP_ID,"public","data","roles");
+        const qEmail = query(rolesCol, where("email","==", user.email));
+        const snap = await getDocs(qEmail);
+        myRole = (!snap.empty) ? (snap.docs[0].data().role) : null;
+      }
+      if(!myRole){ showLogin("Role not found. Create /roles/<UID> with {email, role}"); return; }
+
+      roleHeader.textContent = `Welcome, ${myRole}`;
+
+      // Trader metrics visibility
+      traderMetrics.classList.toggle("hidden", myRole === "admin");
+
+      const isAdmin = myRole === "admin";
+      chartEl.classList.toggle("hidden", isAdmin);
+      tradeBar.classList.toggle("hidden", isAdmin);
+      $("autoRow").classList.toggle("hidden", isAdmin);
+      adminPortfolioView.classList.toggle("hidden", !isAdmin);
+      adminControls.classList.toggle("hidden", !isAdmin ? true : false);
+      $("adminOnlyHint").classList.add("hidden");
+      traderSide.classList.toggle("hidden", !isAdmin ? false : true);
+
+      loginSection.classList.add("hidden");
+      dashboard.classList.remove("hidden");
+
+      await bootstrapStocks();
+      attachRealtime();
+      attachTraderDoc();
+      if (isAdmin) { loadRankingsLoop(); fillTraderDropdown(); }
+
+      initCanvasHiDPI();
+      startTickLoop();
+      startChartLoop();
+    });
+
+    function mapAuthError(err){
+      const code = err?.code || "";
+      if (code.includes("invalid-credential") || code.includes("wrong-password")) return "Incorrect email or password.";
+      if (code.includes("user-not-found")) return "No account found for this email.";
+      if (code.includes("too-many-requests")) return "Too many attempts. Try again later.";
+      if (code.includes("network-request-failed")) return "Network error. Check your connection.";
+      if (code.includes("unauthorized-domain")) return "This domain is not authorized in Firebase Auth.";
+      if (code.includes("operation-not-allowed")) return "Email/Password provider is disabled in Firebase.";
+      return err?.message || "Login failed.";
+    }
+
+    function showLogin(msg){
+      dashboard.classList.add("hidden");
+      loginSection.classList.remove("hidden");
+      if (msg) loginError.innerHTML = `<small class="err">${msg}</small>`;
+    }
+
     logoutBtn.addEventListener("click", async ()=>{
-      try { await signOut(auth); } catch(e){}
+      await signOut(auth);
       location.reload();
     });
 
-    /***** Pricing *****/
+    /***** Pricing (deterministic per 3s tick, smooth interpolation) *****/
     function clamp(n){ return Math.max(1, Number.isFinite(n)? n : 0); }
     function currentPriceFor(stock){
       if (!stock) return 0;
@@ -414,15 +501,15 @@
     }
     function detBase(name){
       const h = hash32(name);
-      return +(300 + ((h % 90000) / 100)).toFixed(2); // 300.00 – 1200.00
+      return +(300 + ((h % 90000) / 100)).toFixed(2);
     }
     function currentTick(){ return Math.floor(Date.now() / TICK_MS); }
     function priceAt(stock, nowMs){
       if (!stock) return 0;
       const base = Number.isFinite(stock.baseline) ? stock.baseline : (stock.defaultBaseline||500);
       if (stock.frozen) return base;
-      const TICK = Math.floor(nowMs / TICK_MS);
-      const seed = hash32(`${stock.id}:${TICK}`);
+      const T = Math.floor(nowMs / TICK_MS);
+      const seed = hash32(`${stock.id}:${T}`);
       const mag = 0.01 + ((seed % 2000) / 100000); // 1–3%
       const sign = (seed & 1) ? 1 : -1;
       const next = base * (1 + sign * mag);
@@ -448,87 +535,6 @@
       return +(pair.p0 + (pair.p1 - pair.p0) * t).toFixed(2);
     }
 
-    /***** Role auto-provision *****/
-    async function ensureRole(user){
-      const roleDocRef = doc(db, "artifacts", APP_ID, "public", "data", "roles", user.uid);
-      try{
-        const roleDoc = await getDoc(roleDocRef);
-        if (roleDoc.exists()){
-          const role = roleDoc.data()?.role || null;
-          if (role) return role;
-        }
-      }catch(_) {}
-      try{
-        if (user.email){
-          const rolesCol = collection(db, "artifacts", APP_ID, "public", "data", "roles");
-          const qEmail = query(rolesCol, where("email","==", user.email));
-          const snap = await getDocs(qEmail);
-          if (!snap.empty){
-            const role = snap.docs[0].data()?.role || "trader";
-            try{ await setDoc(roleDocRef, { email:user.email, role }, { merge:true }); }catch(_){}
-            return role;
-          }
-        }
-      }catch(_) {}
-      try{
-        await setDoc(roleDocRef, { email: user.email || "", role: "trader" }, { merge:true });
-        return "trader";
-      }catch(_){
-        return null;
-      }
-    }
-
-    /***** Auth & app boot (no top-level await blockers) *****/
-    async function boot(){
-      app = initializeApp(FIREBASE_CONFIG);
-      auth = getAuth(app);
-      db   = getFirestore(app);
-
-      try { await setPersistence(auth, browserSessionPersistence); }
-      catch(e){ console.warn("setPersistence failed:", e); }
-
-      onAuthStateChanged(auth, async (user)=>{
-        if(!user){ showLogin(); return; }
-        me = user;
-
-        myRole = await ensureRole(user);
-        if(!myRole){ showLogin("Could not load or create your role. Please retry."); return; }
-
-        roleHeader.textContent = `Welcome, ${myRole}`;
-
-        const isAdmin = (myRole === "admin");
-        traderMetrics.classList.toggle("hidden", isAdmin);
-        chartEl.classList.toggle("hidden", isAdmin);
-        tradeBar.classList.toggle("hidden", isAdmin);
-        $("autoRow").classList.toggle("hidden", isAdmin);
-        adminPortfolioView.classList.toggle("hidden", !isAdmin);
-        adminControls.classList.toggle("hidden", !isAdmin ? true : false);
-        adminOnlyHint.classList.add("hidden");
-        traderSide.classList.toggle("hidden", !isAdmin ? false : true);
-
-        loginSection.classList.add("hidden");
-        dashboard.classList.remove("hidden");
-
-        await bootstrapStocks();
-        attachRealtime();
-        attachTraderDoc();
-        if (isAdmin) { loadRankingsLoop(); fillTraderDropdown(); }
-
-        initCanvasHiDPI();
-        startTickLoop();
-        startChartLoop();
-      });
-
-      // Now users can click the button
-      loginBtn.disabled = false;
-    }
-
-    function showLogin(msg){
-      dashboard.classList.add("hidden");
-      loginSection.classList.remove("hidden");
-      if (msg) loginError.textContent = msg;
-    }
-
     /***** Stocks *****/
     function slug(s){ return s.toLowerCase().replace(/[^a-z0-9]+/g,"_"); }
 
@@ -540,11 +546,10 @@
       const col = collection(db,"artifacts",APP_ID,"public","data","stocks");
       const snap = await getDocs(col);
       if (snap.empty){
-        // Create seed docs (best-effort)
         for(const name of SEED_STOCKS){
           const id = slug(name);
           const base = detBase(name);
-          try{ await setDoc(doc(col,id), { name, baseline: base, frozen:false }, { merge:true }); }catch(_){}
+          try{ await setDoc(doc(col,id), { name, baseline: base, frozen:false }, { merge:true }); }catch(e){}
         }
       }
     }
@@ -570,6 +575,7 @@
             defaultBaseline: prev.defaultBaseline || detBase(data.name||id),
             frozen: !!data.frozen
           };
+
           if (baselineChanged) tickPriceCache[id] = null;
         });
         renderStockTiles();
@@ -635,7 +641,7 @@
       detailPrice.textContent = `₹ ${fmt(newBase)}${s.frozen?' • FROZEN':''}`;
 
       try{ await updateDoc(ref, { baseline:newBase }); }
-      catch(err){ try{ await setDoc(ref, { name: s.name || selectedId, baseline: newBase }, { merge: true }); }catch(_ ){} }
+      catch(err){ try{ await setDoc(ref, { name: s.name || selectedId, baseline: newBase }, { merge: true }); }catch(e){} }
     }
 
     /***** Freeze / Unfreeze *****/
@@ -649,7 +655,7 @@
         s.frozen = true; stocks[selectedId] = s; tickPriceCache[selectedId] = null;
         freezeMsg.textContent = "Selected stock frozen.";
         updateTradeControls();
-      }catch(_){ freezeMsg.textContent = "Could not freeze stock."; }
+      }catch(e){ freezeMsg.textContent = "Could not freeze stock."; }
     });
 
     unfreezeBtn?.addEventListener("click", async ()=>{
@@ -662,7 +668,7 @@
         s.frozen = false; stocks[selectedId] = s; tickPriceCache[selectedId] = null;
         freezeMsg.textContent = "Selected stock unfrozen.";
         updateTradeControls();
-      }catch(_){ freezeMsg.textContent = "Could not unfreeze stock."; }
+      }catch(e){ freezeMsg.textContent = "Could not unfreeze stock."; }
     });
 
     /***** Trader doc + Auto-sell (stop-loss: sell when price <= target) *****/
@@ -684,6 +690,7 @@
       investedCapEl.textContent = fmt(invested);
       profitLossEl.style.color = pl>=0 ? "var(--good)" : "var(--bad)";
       profitLossEl.textContent = `${pl>=0?'+':''}${fmt(plPct)}%`;
+      renderTraderSidePortfolio();
     }
 
     async function attachTraderDoc(){
@@ -698,6 +705,7 @@
         if (myRole === "trader") {
           traderMetrics.classList.remove("hidden");
           traderSide.classList.remove("hidden");
+          updateTraderMetrics();
         }
       });
     }
@@ -760,7 +768,7 @@
               autoMsg.textContent = `Auto-sold at ₹${fmt(price)} (rule cleared)`;
               autoPrice.value = ""; autoQty.value = "";
             }
-          }catch(_) { /* ignore transient */ }
+          }catch(e){ /* ignore transient */ }
         }
       }
     }
@@ -859,12 +867,10 @@
       }
     }
 
-    traderSelect?.addEventListener("change", ()=>{
-      subscribeTraderPortfolio(traderSelect.value);
-    });
-
     let pfUnsub = null;
     function traderRefById(uid){ return doc(db,"artifacts",APP_ID,"public","data","traders", uid); }
+    traderSelect?.addEventListener("change", ()=>{ subscribeTraderPortfolio(traderSelect.value); });
+
     function subscribeTraderPortfolio(uid){
       if (pfUnsub) { pfUnsub(); pfUnsub = null; }
       if (!uid){ portfolioWrap.style.display="none"; return; }
@@ -932,12 +938,12 @@
         const y1 = h - Math.round(((prev - min) / (max - min)) * (h - 8)) - 1;
         const y2 = h - Math.round(((v    - min) / (max - min)) * (h - 8)) - 1;
         const x1 = i-1, x2 = i;
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = v >= prev ? "#3ddc97" : "#ff6b6b";
-        ctx.stroke();
+        chartCtx.beginPath();
+        chartCtx.moveTo(x1, y1);
+        chartCtx.lineTo(x2, y2);
+        chartCtx.lineWidth = 2;
+        chartCtx.strokeStyle = v >= prev ? "#3ddc97" : "#ff6b6b";
+        chartCtx.stroke();
       }
     }
 
@@ -966,7 +972,6 @@
     /***** Tick loop (prices/metrics/autos) *****/
     function updateAllPricesAndDOM(tick){
       const now = Date.now();
-      // Update tile prices once per tick
       Object.values(stocks).forEach(s=>{
         s.price = priceAt(s, now);
         const el = document.getElementById(`p-${s.id}`);
@@ -993,15 +998,9 @@
           checkAutoSells(t);
         }
       };
-      setInterval(loop, 200); // check ~5x/s for a new tick
+      setInterval(loop, 200);
       loop();
     }
-
-    /***** Rankings timers *****/
-    function loadRankingsLoop(){ loadRankings(); setInterval(loadRankings, 6000); }
-
-    // Kick off app
-    boot();
   </script>
 </body>
 </html>
