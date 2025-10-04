@@ -47,7 +47,7 @@
     .btn-ghost{ background:transparent; border-color:var(--border); color:var(--text) }
     .btn-ghost:hover{ background:#ffffff14 }
     /* Login */
-    .login-shell{ min-height:100vh; display:grid; place-items:center; } /* fullscreen */
+    .login-shell{ min-height:100vh; display:grid; place-items:center; }
     .login-box{ width:min(480px,100%); padding:28px }
     .input{
       width:100%; padding:12px 14px; border-radius:10px; border:1px solid var(--border); background:#0e1a34; color:#fff;
@@ -365,10 +365,22 @@
     // id -> { id, name, baseline, price, defaultBaseline, lastJumpAt, frozen }
     let stocks = {};
     let myTrader = null;
+
+    // Chart state
     let series = [];
+    const SAMPLE_MS = 120;      // ~8–9 fps for smoothness
+    let lastSampleAt = 0;
     let chartCtx = $("chart").getContext("2d");
-    let lastSampleTime = 0;
-    let pfUnsub = null; // realtime subscription for admin portfolio view
+
+    // Ticking (app logic every 3s)
+    const TICK_MS = 3000;
+    let lastProcessedTick = -1;
+
+    // Auto-sell debounce
+    let lastAutosTick = -1;
+
+    // Interpolation cache per stock for smooth charting
+    const tickPriceCache = {}; // { [stockId]: { tick, p0, p1, base } }
 
     const SEED_STOCKS = [
       "Reliance Industries","TCS","Infosys","HDFC Bank","ICICI Bank",
@@ -379,7 +391,6 @@
     ];
 
     /***** PRICING *****/
-    const TICK_MS = 3000;
     function clamp(n){ return Math.max(1, Number.isFinite(n)? n : 0); }
     function currentPriceFor(stock){
       if (!stock) return 0;
@@ -388,25 +399,49 @@
       return base;
     }
 
-    // Deterministic price so every dashboard shows the same value
+    // Deterministic helpers
     function hash32(str){
       let h = 2166136261 >>> 0;
-      for (let i=0;i<str.length;i++){
-        h ^= str.charCodeAt(i);
-        h = Math.imul(h, 16777619);
-      }
+      for (let i=0;i<str.length;i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
       return h >>> 0;
     }
+    function detBase(name){
+      const h = hash32(name);
+      return +(300 + ((h % 90000) / 100)).toFixed(2); // 300.00 – 1200.00
+    }
+    function currentTick(){ return Math.floor(Date.now() / TICK_MS); }
+
     function priceAt(stock, nowMs){
       if (!stock) return 0;
       const base = Number.isFinite(stock.baseline) ? stock.baseline : (stock.defaultBaseline||500);
-      if (stock.frozen) return base; // frozen → pinned to baseline
+      if (stock.frozen) return base;
       const TICK = Math.floor(nowMs / TICK_MS);
       const seed = hash32(`${stock.id}:${TICK}`);
       const mag = 0.01 + ((seed % 2000) / 100000); // 1–3%
       const sign = (seed & 1) ? 1 : -1;
       const next = base * (1 + sign * mag);
       return Math.round(next * 100) / 100;
+    }
+
+    // Tick interpolation for smooth chart
+    function ensureTickPair(s, nowMs){
+      const tick = Math.floor(nowMs / TICK_MS);
+      const base = s.baseline;
+      const entry = tickPriceCache[s.id];
+      if (!entry || entry.tick !== tick || entry.base !== base){
+        const p0 = priceAt(s, tick * TICK_MS);
+        const p1 = priceAt(s, (tick + 1) * TICK_MS);
+        tickPriceCache[s.id] = { tick, p0, p1, base };
+        return tickPriceCache[s.id];
+      }
+      return entry;
+    }
+    function interpolatedPrice(s, nowMs){
+      if (!s || s.frozen) return Number.isFinite(s?.baseline) ? s.baseline : (s?.defaultBaseline||0);
+      const pair = ensureTickPair(s, nowMs);
+      const t0 = pair.tick * TICK_MS;
+      const t = Math.min(1, Math.max(0, (nowMs - t0) / TICK_MS));
+      return +(pair.p0 + (pair.p1 - pair.p0) * t).toFixed(2);
     }
 
     /***** Auth & Roles *****/
@@ -429,34 +464,28 @@
       roleHeader.textContent = `Welcome, ${myRole}`;
 
       // Trader metrics visibility
-      if (myRole === "admin"){
-        traderMetrics.classList.add("hidden");
-      } else {
-        traderMetrics.classList.remove("hidden");
-      }
+      traderMetrics.classList.toggle("hidden", myRole === "admin");
 
       const isAdmin = myRole === "admin";
-      // Left panel
       chartEl.classList.toggle("hidden", isAdmin);
       tradeBar.classList.toggle("hidden", isAdmin);
       $("autoRow").classList.toggle("hidden", isAdmin);
       adminPortfolioView.classList.toggle("hidden", !isAdmin);
-      // Right panel toggle
       adminControls.classList.toggle("hidden", !isAdmin ? true : false);
-      adminOnlyHint.classList.toggle("hidden", true);
+      $("adminOnlyHint").classList.add("hidden");
       traderSide.classList.toggle("hidden", !isAdmin ? false : true);
 
       loginSection.classList.add("hidden");
       dashboard.classList.remove("hidden");
 
       await bootstrapStocks();
-      attachRealtime();              // realtime stocks for ALL users
-      startAnimationLoop();
-      attachTraderDoc();             // realtime SELF trader doc
+      attachRealtime();
+      attachTraderDoc();
       if (isAdmin) { loadRankingsLoop(); fillTraderDropdown(); }
 
-      // NOTE: removed the old random jump interval for deterministic pricing
-      // setInterval(()=> { Object.values(stocks).forEach(s => jumpOnce(s)); }, TICK_MS);
+      initCanvasHiDPI();
+      startTickLoop();   // 3s logic
+      startChartLoop();  // smooth chart
     });
 
     function showLogin(msg){
@@ -488,15 +517,15 @@
     async function bootstrapStocks(){
       SEED_STOCKS.forEach((name)=>{
         const id = slug(name);
-        if (!stocks[id]) stocks[id] = { id, name, defaultBaseline: +(300 + Math.random()*900).toFixed(2) };
+        if (!stocks[id]) stocks[id] = { id, name, defaultBaseline: detBase(name) };
       });
       const col = collection(db,"artifacts",APP_ID,"public","data","stocks");
       const snap = await getDocs(col);
-      if (snap.empty && myRole==="admin"){
+      if (snap.empty){
         for(const name of SEED_STOCKS){
           const id = slug(name);
-          const base = +(stocks[id]?.defaultBaseline || (300+Math.random()*900)).toFixed(2);
-          await setDoc(doc(col,id), { name, baseline: base, frozen:false });
+          const base = detBase(name);
+          try{ await setDoc(doc(col,id), { name, baseline: base, frozen:false }, { merge:true }); }catch(e){}
         }
       }
     }
@@ -519,13 +548,16 @@
             name: data.name || prev.name || id,
             baseline: Number.isFinite(base) ? base : prev.baseline,
             price: clamp(priceInit),
-            defaultBaseline: prev.defaultBaseline || +(300 + Math.random()*900).toFixed(2),
+            defaultBaseline: prev.defaultBaseline || detBase(data.name||id),
             lastJumpAt: prev.lastJumpAt || 0,
             frozen: !!data.frozen
           };
+
+          if (baselineChanged) tickPriceCache[id] = null;
         });
         renderStockTiles();
         if (selectedId && stocks[selectedId]) detailName.textContent = stocks[selectedId].name;
+        updateTradeControls();
       });
     }
 
@@ -548,25 +580,25 @@
       const isFrozen = !!s?.frozen;
       buyBtn.disabled = sellBtn.disabled = isFrozen || (myRole!=="trader");
       setAutoBtn.disabled = clearAutoBtn.disabled = isFrozen || (myRole!=="trader");
-      if (isFrozen){
-        tradeMsg.textContent = "This stock is frozen. Trading disabled.";
-      }
+      tradeMsg.textContent = isFrozen ? "This stock is frozen. Trading disabled." : "";
     }
 
     function selectStock(id){
       selectedId = id;
       const s = stocks[id];
       detailName.textContent = s.name;
-      series = [];
+      series = []; lastSampleAt = 0;
       tradeMsg.textContent = "";
       adminSelected.textContent = s.name || "None";
       adminSelectedPrice.textContent = `• ₹ ${fmt(currentPriceFor(s))}${s.frozen?' • FROZEN':''}`;
+      tickPriceCache[id] = null;
       raiseBtn.disabled = lowerBtn.disabled = (myRole!=="admin");
       raise50Btn.disabled = lower50Btn.disabled = (myRole!=="admin");
       updateTradeControls();
+      drawChart();
     }
 
-    // Admin ±10%/±50% (writes baseline; all clients snap to it via onSnapshot + deterministic pricing)
+    // Admin ±10%/±50%
     raiseBtn?.addEventListener("click", ()=> adjustSelected( 0.10));
     lowerBtn?.addEventListener("click", ()=> adjustSelected(-0.10));
     raise50Btn?.addEventListener("click", ()=> adjustSelected( 0.50));
@@ -579,21 +611,14 @@
       const base = Number.isFinite(s.baseline) ? s.baseline : (s.defaultBaseline||500);
       const newBase = +(base * (1+delta)).toFixed(2);
 
-      // Optimistic local UI
-      s.baseline = newBase;
-      s.price = newBase;
-      stocks[selectedId] = s;
+      // Optimistic UI
+      s.baseline = newBase; s.price = newBase; stocks[selectedId] = s;
+      tickPriceCache[selectedId] = null;
       adminSelectedPrice.textContent = `• ₹ ${fmt(newBase)}${s.frozen?' • FROZEN':''}`;
+      detailPrice.textContent = `₹ ${fmt(newBase)}${s.frozen?' • FROZEN':''}`;
 
-      try{
-        await updateDoc(ref, { baseline:newBase });
-      }catch(err){
-        try{
-          await setDoc(ref, { name: s.name || selectedId, baseline: newBase }, { merge: true });
-        }catch(err2){
-          console.error("Admin baseline write failed:", err2);
-        }
-      }
+      try{ await updateDoc(ref, { baseline:newBase }); }
+      catch(err){ try{ await setDoc(ref, { name: s.name || selectedId, baseline: newBase }, { merge: true }); }catch(e){} }
     }
 
     /***** Freeze / Unfreeze *****/
@@ -604,12 +629,10 @@
       const ref = doc(db,"artifacts",APP_ID,"public","data","stocks", selectedId);
       try{
         await setDoc(ref, { name: s.name || selectedId, frozen: true }, { merge: true });
-        s.frozen = true; stocks[selectedId] = s;
+        s.frozen = true; stocks[selectedId] = s; tickPriceCache[selectedId] = null;
         freezeMsg.textContent = "Selected stock frozen.";
         updateTradeControls();
-      }catch(e){
-        freezeMsg.textContent = "Could not freeze stock.";
-      }
+      }catch(e){ freezeMsg.textContent = "Could not freeze stock."; }
     });
 
     unfreezeBtn?.addEventListener("click", async ()=>{
@@ -619,12 +642,10 @@
       const ref = doc(db,"artifacts",APP_ID,"public","data","stocks", selectedId);
       try{
         await setDoc(ref, { name: s.name || selectedId, frozen: false }, { merge: true });
-        s.frozen = false; stocks[selectedId] = s;
+        s.frozen = false; stocks[selectedId] = s; tickPriceCache[selectedId] = null;
         freezeMsg.textContent = "Selected stock unfrozen.";
         updateTradeControls();
-      }catch(e){
-        freezeMsg.textContent = "Could not unfreeze stock.";
-      }
+      }catch(e){ freezeMsg.textContent = "Could not unfreeze stock."; }
     });
 
     /***** Trader doc + Auto-sell *****/
@@ -646,8 +667,6 @@
       investedCapEl.textContent = fmt(invested);
       profitLossEl.style.color = pl>=0 ? "var(--good)" : "var(--bad)";
       profitLossEl.textContent = `${pl>=0?'+':''}${fmt(plPct)}%`;
-
-      renderTraderSidePortfolio();
     }
 
     async function attachTraderDoc(){
@@ -662,8 +681,6 @@
         if (myRole === "trader") {
           traderMetrics.classList.remove("hidden");
           traderSide.classList.remove("hidden");
-          updateTraderMetrics();
-          renderTraderSidePortfolio();
         }
       });
     }
@@ -675,7 +692,7 @@
       const st = stocks[selectedId];
       if (st?.frozen){ autoMsg.textContent = "This stock is frozen. Trading disabled."; return; }
       const p = parseFloat(autoPrice.value);
-      const q = Math.max(1, parseInt(autoQty.value||"1",10));
+      const q = Math.max(1, Math.min(1_000_000, parseInt(autoQty.value||"1",10)));
       if (!Number.isFinite(p) || p<=0){ autoMsg.textContent = "Enter a valid price."; return; }
       const ref = traderRef(me.uid);
       const autos = { ...(myTrader?.autos||{}) };
@@ -691,37 +708,48 @@
       const autos = { ...(myTrader?.autos||{}) };
       delete autos[selectedId];
       await setDoc(ref, { autos }, { merge:true });
+      autoPrice.value = ""; autoQty.value = "";
       autoMsg.textContent = "Cleared.";
     });
 
-    async function checkAutoSells(){
+    // AUTO-SELL: trigger when price <= target (stop-loss behavior)
+    async function checkAutoSells(tick){
       if (!me || myRole!=="trader" || !myTrader) return;
+      if (tick === lastAutosTick) return; // once per tick
+      lastAutosTick = tick;
       const autos = myTrader.autos || {};
       for (const [sid, rule] of Object.entries(autos)){
         const st = stocks[sid]; if (!st || st.frozen) continue;
         const price = currentPriceFor(st);
-        if (price >= rule.price){
+        if (price <= rule.price){
           const ref = traderRef(me.uid);
-          const snap = await getDoc(ref);
-          const t = snap.exists()? snap.data(): { cash:0, initialCash:0, portfolio:{} };
-          const pos = t.portfolio?.[sid] || { quantity:0 };
-          const sellQty = Math.min(rule.qty||0, pos.quantity||0);
-          if (sellQty > 0){
-            t.cash = (+t.cash||0) + sellQty*price;
-            pos.quantity -= sellQty;
-            if (pos.quantity>0) t.portfolio[sid] = pos; else delete t.portfolio[sid];
-            const autos2 = { ...(t.autos||{}) }; delete autos2[sid];
-            await setDoc(ref, { cash:t.cash, portfolio:t.portfolio, autos:autos2 }, { merge:true });
-            if (sid===selectedId){ autoMsg.textContent = `Auto-sold ${sellQty} at ₹${fmt(price)}`; }
-          } else {
-            const autos2 = { ...(t.autos||{}) }; delete autos2[sid];
-            await setDoc(ref, { autos:autos2 }, { merge:true });
-          }
+          try{
+            await runTransaction(db, async (tx)=>{
+              const snap = await tx.get(ref);
+              const t = snap.exists()? snap.data(): { cash:0, initialCash:0, portfolio:{}, autos:{} };
+              const pos = t.portfolio?.[sid] || { quantity:0 };
+              const sellQty = Math.min(rule.qty||0, pos.quantity||0);
+              const newAutos = { ...(t.autos||{}) }; delete newAutos[sid];
+              if (sellQty > 0){
+                const newCash = (+t.cash||0) + sellQty*price;
+                const newQty = (pos.quantity||0) - sellQty;
+                const newPortfolio = { ...(t.portfolio||{}) };
+                if (newQty>0) newPortfolio[sid] = { quantity:newQty }; else delete newPortfolio[sid];
+                tx.set(ref, { cash:+newCash.toFixed(2), portfolio:newPortfolio, autos:newAutos }, { merge:true });
+              } else {
+                tx.set(ref, { autos:newAutos }, { merge:true });
+              }
+            });
+            if (sid===selectedId){
+              autoMsg.textContent = `Auto-sold at ₹${fmt(price)} (rule cleared)`;
+              autoPrice.value = ""; autoQty.value = "";
+            }
+          }catch(e){ /* ignore transient */ }
         }
       }
     }
 
-    /***** Trader helpers & actions *****/
+    /***** Rankings & Admin helpers *****/
     async function portfolioAndStats(uid){
       const s = await getDoc(traderRef(uid));
       const data = s.exists()? s.data(): { cash:0, initialCash:0, portfolio:{} };
@@ -737,64 +765,8 @@
       return { working, invested, pl, plPct, data };
     }
 
-    buyBtn.addEventListener("click", ()=> trade("buy"));
-    sellBtn.addEventListener("click",()=> trade("sell"));
+    const resetBtn = $("resetBtn");
 
-    // Transactional trade to prevent infinite-cash exploits and reflect portfolio instantly
-    async function trade(kind){
-      tradeMsg.textContent = "";
-      if (!me){ tradeMsg.textContent="Please log in."; return; }
-      if (!selectedId){ tradeMsg.textContent="Select a stock first."; return; }
-
-      const q = Math.max(1, parseInt(qtyEl.value||"1",10));
-      const st = stocks[selectedId];
-      if (st?.frozen){ tradeMsg.textContent = "This stock is frozen. Trading disabled."; return; }
-      const price = currentPriceFor(st);
-
-      // Disable buttons during processing
-      buyBtn.disabled = true; sellBtn.disabled = true;
-
-      const ref = traderRef(me.uid);
-
-      try{
-        await runTransaction(db, async (tx)=>{
-          const snap = await tx.get(ref);
-          const t = snap.exists()? snap.data(): { cash:100000, initialCash:100000, portfolio:{} };
-          const portfolio = t.portfolio || {};
-          const pos = portfolio[selectedId] || { quantity:0 };
-          const cash = +t.cash || 0;
-
-          if (kind === "buy"){
-            const cost = q * price;
-            if (cash < cost) throw new Error("Not enough cash.");
-            const newCash = +(cash - cost).toFixed(2);
-            const newQty = (pos.quantity||0) + q;
-            const newPortfolio = { ...portfolio, [selectedId]: { quantity:newQty } };
-            tx.set(ref, { cash:newCash, portfolio:newPortfolio }, { merge:true });
-          } else {
-            const have = pos.quantity||0;
-            if (have < q) throw new Error("Not enough shares.");
-            const newQty = have - q;
-            const newCash = +(cash + q * price).toFixed(2);
-            const newPortfolio = { ...portfolio };
-            if (newQty > 0) newPortfolio[selectedId] = { quantity:newQty };
-            else delete newPortfolio[selectedId];
-            tx.set(ref, { cash:newCash, portfolio:newPortfolio }, { merge:true });
-          }
-        });
-
-        tradeMsg.textContent = kind==="buy" ? `Bought ${q}` : `Sold ${q}`;
-      }catch(err){
-        tradeMsg.textContent = err?.message || "Trade failed. Try again.";
-      }finally{
-        buyBtn.disabled = (myRole!=="trader") || !!st?.frozen;
-        sellBtn.disabled = (myRole!=="trader") || !!st?.frozen;
-      }
-
-      if (myRole==="trader") updateTraderMetrics(); // triggers side portfolio refresh too
-    }
-
-    /***** Admin: Funds, Reset, Rankings, Trader dropdown (REALTIME portfolio) *****/
     applyFundsBtn.addEventListener("click", async ()=>{
       if(myRole!=="admin")return;
       const amt=parseFloat(allFunds.value);
@@ -809,7 +781,6 @@
       fundsMsg.textContent="Updated for all traders.";
     });
 
-    const resetBtn = $("resetBtn");
     resetBtn.addEventListener("click", async ()=>{
       if(myRole!=="admin")return;
       if(!confirm("This will reset ALL traders and ALL stocks. Continue?")) return;
@@ -825,12 +796,9 @@
       const stocksCol=collection(db,"artifacts",APP_ID,"public","data","stocks");
       const sSnap=await getDocs(stocksCol);
       for(const d of sSnap.docs){
-        const newBase=+(300+Math.random()*900).toFixed(2);
-        try{
-          await updateDoc(d.ref,{baseline:newBase, frozen:false});
-        }catch(err){
-          await setDoc(d.ref,{baseline:newBase, frozen:false},{merge:true});
-        }
+        const newBase=detBase(d.data().name||d.id);
+        try{ await updateDoc(d.ref,{baseline:newBase, frozen:false}); }
+        catch(err){ await setDoc(d.ref,{baseline:newBase, frozen:false},{merge:true}); }
       }
       alert("System RESET complete.");
     });
@@ -879,24 +847,15 @@
       subscribeTraderPortfolio(traderSelect.value);
     });
 
+    let pfUnsub = null;
+    function traderRefById(uid){ return doc(db,"artifacts",APP_ID,"public","data","traders", uid); }
     function subscribeTraderPortfolio(uid){
       if (pfUnsub) { pfUnsub(); pfUnsub = null; }
       if (!uid){ portfolioWrap.style.display="none"; return; }
-      pfUnsub = onSnapshot(traderRef(uid), async (snap)=>{
+      pfUnsub = onSnapshot(traderRefById(uid), async (snap)=>{
         if (!snap.exists()){ portfolioWrap.style.display="none"; return; }
         const data = snap.data();
-        const working = +data.cash || 0;
-        let invested = 0;
-        Object.entries(data.portfolio||{}).forEach(([sid,pos])=>{
-          const st = stocks[sid]; if (!st) return;
-          invested += (pos.quantity||0)*currentPriceFor(st);
-        });
-        const initial = +data.initialCash || 0;
-        const pl = (working+invested)-initial;
-        const plPct = initial? (pl/initial*100) : 0;
-
         pfTitle.textContent = `Portfolio – ${traderSelect.selectedOptions[0].textContent}`;
-        pfSummary.textContent = `Working: ₹${fmt(working)}  •  Invested: ₹${fmt(invested)}  •  P/L: ${pl>=0?'+':''}${fmt(pl)} (${fmt(plPct)}%)`;
         pfTable.innerHTML = "";
         Object.entries(data.portfolio||{}).forEach(([sid,pos])=>{
           const p = currentPriceFor(stocks[sid]);
@@ -906,93 +865,124 @@
           pfTable.appendChild(tr);
         });
         portfolioWrap.style.display = "block";
+        refreshAdminPortfolioSummary(uid, data);
       });
     }
 
-    function renderTraderSidePortfolio(){
-      if (!myTrader){ traderSide.classList.add("hidden"); return; }
-      const portfolio = myTrader.portfolio || {};
+    function refreshAdminPortfolioSummary(uid, data){
+      const working = +data.cash || 0;
       let invested = 0;
-      traderPfTable.innerHTML = "";
-      Object.entries(portfolio).forEach(([sid,pos])=>{
-        const st = stocks[sid]; if(!st) return;
-        const p = currentPriceFor(st);
-        const qty = pos.quantity || 0;
-        const val = p * qty;
-        invested += val;
-        const tr = document.createElement("tr"); tr.className="data";
-        tr.innerHTML = `<td>${st?.name||sid}</td><td>${qty}</td><td>₹ ${fmt(p)}</td><td>₹ ${fmt(val)}</td>`;
-        traderPfTable.appendChild(tr);
+      Object.entries(data.portfolio||{}).forEach(([sid,pos])=>{
+        const st = stocks[sid]; if (!st) return;
+        invested += (pos.quantity||0)*currentPriceFor(st);
       });
-
-      const cash = +myTrader.cash || 0;
-      const initial = +myTrader.initialCash || 0;
-      const pl = (cash + invested) - initial;
-      const plPct = initial ? (pl/initial*100) : 0;
-
-      traderPfSummary.textContent = `Working: ₹${fmt(cash)}  •  Invested: ₹${fmt(invested)}  •  P/L: ${pl>=0?'+':''}${fmt(pl)} (${fmt(plPct)}%)`;
+      const initial = +data.initialCash || 0;
+      const pl = (working+invested)-initial;
+      const plPct = initial? (pl/initial*100) : 0;
+      pfSummary.textContent = `Working: ₹${fmt(working)}  •  Invested: ₹${fmt(invested)}  •  P/L: ${pl>=0?'+':''}${fmt(pl)} (${fmt(plPct)}%)`;
     }
 
-    /***** Animation: tiles/price text, chart, autos, metrics *****/
+    /***** Chart & formatting *****/
     function fmt(n){ return (+n).toLocaleString("en-IN",{maximumFractionDigits:2,minimumFractionDigits:2}); }
+
+    function initCanvasHiDPI(){
+      function resize(){
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        const rect = chartEl.getBoundingClientRect();
+        chartEl.width = Math.max(1, Math.floor(rect.width * dpr));
+        chartEl.height = Math.max(1, Math.floor(rect.height * dpr));
+        chartCtx.setTransform(1,0,0,1,0,0);
+        drawChart();
+      }
+      window.addEventListener('resize', resize);
+      resize();
+    }
 
     function drawChart(){
       const w = chartEl.width, h = chartEl.height;
       const ctx = chartCtx;
       ctx.clearRect(0,0,w,h);
       if (!series.length) return;
+
       let min = Math.min(...series), max = Math.max(...series);
       if (min === max){ min -= 1; max += 1; }
-      const xStep = Math.max(1, Math.floor(w / Math.max(60, series.length)));
-      for (let i=0; i<series.length; i++){
-        const v = series[i];
-        const norm = (v - min) / (max - min);
-        const barH = Math.max(2, Math.round(norm * (h - 8)));
-        const x = i * xStep;
-        chartCtx.fillStyle = i>0 && v>=series[i-1] ? "#3ddc97" : "#ff6b6b";
-        chartCtx.fillRect(x, h - barH, xStep-1, barH);
+
+      const maxPts = w;
+      const start = Math.max(0, series.length - maxPts);
+      const pts = series.slice(start);
+
+      for (let i=1; i<pts.length; i++){
+        const prev = pts[i-1], v = pts[i];
+        const y1 = h - Math.round(((prev - min) / (max - min)) * (h - 8)) - 1;
+        const y2 = h - Math.round(((v    - min) / (max - min)) * (h - 8)) - 1;
+        const x1 = i-1, x2 = i;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = v >= prev ? "#3ddc97" : "#ff6b6b";
+        ctx.stroke();
       }
     }
 
-    function startAnimationLoop(){
-      let last = performance.now();
-      function tick(now){
-        if (now - last > 100){
-          last = now;
-
-          // Sync price for all stocks across all clients
-          const nowMs = Date.now();
-          Object.values(stocks).forEach(s=>{
-            s.price = priceAt(s, nowMs);
-            const el = document.getElementById(`p-${s.id}`);
-            if (el) el.textContent = fmt(s.price);
-          });
-
-          if (selectedId && stocks[selectedId]){
-            const s = stocks[selectedId];
-            const p = s.price;
-            detailPrice.textContent = `₹ ${fmt(p)}${s.frozen?' • FROZEN':''}`;
-            if (myRole==="admin") {
-              adminSelectedPrice.textContent = `• ₹ ${fmt(p)}${s.frozen?' • FROZEN':''}`;
-            }
-            if (!chartEl.classList.contains("hidden")) {
-              if (now - lastSampleTime > 200){
-                lastSampleTime = now;
-                series.push(p);
-                if (series.length > 120) series.shift();
-                drawChart();
-              }
-            }
-            updateTradeControls();
+    // Smooth chart loop (interpolates selected stock)
+    function startChartLoop(){
+      function frame(nowMs){
+        if (selectedId && stocks[selectedId] && !chartEl.classList.contains("hidden")){
+          const s = stocks[selectedId];
+          const p = interpolatedPrice(s, nowMs);
+          detailPrice.textContent = `₹ ${fmt(p)}${s.frozen?' • FROZEN':''}`;
+          if (myRole==="admin") {
+            adminSelectedPrice.textContent = `• ₹ ${fmt(p)}${s.frozen?' • FROZEN':''}`;
           }
-
-          if (myRole==="trader"){ updateTraderMetrics(); checkAutoSells(); renderTraderSidePortfolio(); }
+          if (nowMs - lastSampleAt >= SAMPLE_MS){
+            lastSampleAt = nowMs;
+            series.push(p);
+            if (series.length > 10000) series.shift();
+            drawChart();
+          }
         }
-        requestAnimationFrame(tick);
+        requestAnimationFrame(frame);
       }
-      requestAnimationFrame(tick);
+      requestAnimationFrame(frame);
     }
+
+    /***** Tick loop (prices/metrics/autos) *****/
+    function updateAllPricesAndDOM(tick){
+      const now = Date.now();
+      // Update tile prices once per tick
+      Object.values(stocks).forEach(s=>{
+        s.price = priceAt(s, now);
+        const el = document.getElementById(`p-${s.id}`);
+        if (el) el.textContent = fmt(s.price);
+      });
+
+      if (myRole==="trader"){ updateTraderMetrics(); }
+
+      // refresh admin portfolio summary if open
+      if (traderSelect && traderSelect.value && portfolioWrap.style.display!=="none"){
+        const uid = traderSelect.value;
+        getDoc(traderRefById(uid)).then(s=>{ if(s.exists()) refreshAdminPortfolioSummary(uid, s.data()); });
+      }
+    }
+
+    function startTickLoop(){
+      const firstTick = currentTick();
+      lastProcessedTick = firstTick - 1;
+      const loop = ()=>{
+        const t = currentTick();
+        if (t !== lastProcessedTick){
+          lastProcessedTick = t;
+          updateAllPricesAndDOM(t);
+          checkAutoSells(t);
+        }
+      };
+      setInterval(loop, 200); // check ~5x/s for a new tick
+      loop();
+    }
+
+    /***** Rankings timers *****/
+    function loadRankingsLoop(){ loadRankings(); setInterval(loadRankings, 6000); }
   </script>
 </body>
 </html>
-
