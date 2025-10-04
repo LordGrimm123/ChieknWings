@@ -297,7 +297,8 @@
 
     /* Require login each tab session */
     await setPersistence(auth, browserSessionPersistence);
-    try{ await signOut(auth); }catch(e){}
+    // Removed forced sign-out that was breaking login on page load.
+    // try{ await signOut(auth); }catch(e){}
 
     /***** Elements *****/
     const $ = (id)=>document.getElementById(id);
