@@ -295,10 +295,8 @@
     const auth = getAuth(app);
     const db = getFirestore(app);
 
-    /* Require login each tab session */
+    /* Session-only persistence (no forced sign-out) */
     await setPersistence(auth, browserSessionPersistence);
-    // Removed forced sign-out that was breaking login on page load.
-    // try{ await signOut(auth); }catch(e){}
 
     /***** Elements *****/
     const $ = (id)=>document.getElementById(id);
@@ -363,24 +361,19 @@
     /***** State *****/
     let me = null, myRole = null;
     let selectedId = null;
-    // id -> { id, name, baseline, price, defaultBaseline, lastJumpAt, frozen }
-    let stocks = {};
+    let stocks = {}; // id -> { id, name, baseline, price, defaultBaseline, frozen }
     let myTrader = null;
 
     // Chart state
     let series = [];
-    const SAMPLE_MS = 120;      // ~8–9 fps for smoothness
+    const SAMPLE_MS = 120;      // ~8–9 fps
     let lastSampleAt = 0;
     let chartCtx = $("chart").getContext("2d");
 
     // Ticking (app logic every 3s)
     const TICK_MS = 3000;
     let lastProcessedTick = -1;
-
-    // Auto-sell debounce
-    let lastAutosTick = -1;
-
-    // Interpolation cache per stock for smooth charting
+    let lastAutosTick = -1; // debounce auto-sell per tick
     const tickPriceCache = {}; // { [stockId]: { tick, p0, p1, base } }
 
     const SEED_STOCKS = [
@@ -399,8 +392,6 @@
       const base = Number.isFinite(stock.baseline) ? stock.baseline : (stock.defaultBaseline||500);
       return base;
     }
-
-    // Deterministic helpers
     function hash32(str){
       let h = 2166136261 >>> 0;
       for (let i=0;i<str.length;i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
@@ -423,8 +414,6 @@
       const next = base * (1 + sign * mag);
       return Math.round(next * 100) / 100;
     }
-
-    // Tick interpolation for smooth chart
     function ensureTickPair(s, nowMs){
       const tick = Math.floor(nowMs / TICK_MS);
       const base = s.baseline;
@@ -445,22 +434,53 @@
       return +(pair.p0 + (pair.p1 - pair.p0) * t).toFixed(2);
     }
 
+    /***** Role auto-provision *****/
+    async function ensureRole(user){
+      // 1) Check doc by UID
+      const roleDocRef = doc(db, "artifacts", APP_ID, "public", "data", "roles", user.uid);
+      try{
+        const roleDoc = await getDoc(roleDocRef);
+        if (roleDoc.exists()){
+          const role = roleDoc.data()?.role || null;
+          if (role) return role;
+        }
+      }catch(e){ /* continue to fallback */ }
+
+      // 2) Fallback by email match (any doc in roles with email == user.email)
+      try{
+        if (user.email){
+          const rolesCol = collection(db, "artifacts", APP_ID, "public", "data", "roles");
+          const qEmail = query(rolesCol, where("email","==", user.email));
+          const snap = await getDocs(qEmail);
+          if (!snap.empty){
+            const role = snap.docs[0].data()?.role || "trader";
+            // also backfill UID doc for faster next logins
+            try{ await setDoc(roleDocRef, { email: user.email, role }, { merge: true }); }catch(_){}
+            return role;
+          }
+        }
+      }catch(e){ /* ignore and auto-provision */ }
+
+      // 3) Auto-provision default role: trader
+      try{
+        await setDoc(roleDocRef, { email: user.email || "", role: "trader" }, { merge: true });
+        return "trader";
+      }catch(e){
+        return null; // last resort -> caller will showLogin with message
+      }
+    }
+
     /***** Auth & Roles *****/
     onAuthStateChanged(auth, async (user)=>{
       if(!user){ showLogin(); return; }
       me = user;
 
-      // role by UID first; fallback by email
-      let myRoleDoc = await getDoc(doc(db,"artifacts",APP_ID,"public","data","roles", user.uid));
-      if (myRoleDoc.exists()){
-        myRole = myRoleDoc.data().role;
-      } else {
-        const rolesCol = collection(db,"artifacts",APP_ID,"public","data","roles");
-        const qEmail = query(rolesCol, where("email","==", user.email));
-        const snap = await getDocs(qEmail);
-        myRole = (!snap.empty) ? (snap.docs[0].data().role) : null;
+      // Auto-provision & resolve role
+      myRole = await ensureRole(user);
+      if(!myRole){
+        showLogin("Could not load or create your role. Please retry.");
+        return;
       }
-      if(!myRole){ showLogin("Role not found. Create /roles/<UID> with {email, role}."); return; }
 
       roleHeader.textContent = `Welcome, ${myRole}`;
 
@@ -501,7 +521,8 @@
       try{
         await signInWithEmailAndPassword(auth, $("email").value.trim(), $("password").value.trim());
       }catch(err){
-        loginError.innerHTML = `<small class="err">${err.message}</small>`;
+        // functionally safe & simple
+        loginError.textContent = err?.message || "Login failed.";
       }finally{
         loginBtn.disabled = false; loginBtn.textContent = "Log in";
       }
@@ -550,7 +571,6 @@
             baseline: Number.isFinite(base) ? base : prev.baseline,
             price: clamp(priceInit),
             defaultBaseline: prev.defaultBaseline || detBase(data.name||id),
-            lastJumpAt: prev.lastJumpAt || 0,
             frozen: !!data.frozen
           };
 
@@ -713,7 +733,7 @@
       autoMsg.textContent = "Cleared.";
     });
 
-    // AUTO-SELL: trigger when price <= target (stop-loss behavior)
+    // AUTO-SELL: stop-loss (fires when tick price <= target)
     async function checkAutoSells(tick){
       if (!me || myRole!=="trader" || !myTrader) return;
       if (tick === lastAutosTick) return; // once per tick
