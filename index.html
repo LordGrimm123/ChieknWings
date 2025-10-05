@@ -413,7 +413,7 @@
       const mag = 0.01 + Math.random()*0.02; // 1–3%
       const sign = Math.random() < 0.5 ? -1 : 1;
       const next = base * (1 + sign*mag);
-      stock.price = Math.max(0,Math.round((next * 100) / 100);
+      stock.price = Math.round(next * 100) / 100;
     }
 
     /***** Auth & Roles *****/
